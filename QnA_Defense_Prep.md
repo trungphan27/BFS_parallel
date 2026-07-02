@@ -52,6 +52,26 @@ Nhóm sử dụng **1D Block Partitioning** (Phân hoạch không gian 1 chiều
 - Cụ thể: Tổng số đỉnh $N$ được chia đều cho $P$ tiến trình. Tiến trình thứ $r$ sẽ "sở hữu" liên tục các đỉnh từ $\lfloor N \cdot r / P \rfloor$ đến $\lfloor N \cdot (r+1) / P \rfloor$.
 - Owner-Computes Rule có nghĩa là: Tiến trình nào sở hữu đỉnh nào thì tiến trình đó chịu trách nhiệm tính toán và cập nhật giá trị khoảng cách `dist[]` cho đỉnh đó.
 
+### Q5b. Cụ thể trong Project này, với cluster 3 máy (1 Master 4 core, 2 Slaves x 2 core), các tiến trình được phân chia (Mapping) như thế nào để tối ưu?
+**Trả lời:**
+Do cấu hình của 3 máy không đồng đều (heterogeneous), việc phân chia tiến trình đóng vai trò sống còn đến hiệu năng (tránh mất cân bằng tải - Load Imbalance). Có 2 phương án phân chia, và nhóm đã chọn phương án tối ưu nhất dựa trên code hiện tại:
+
+**Phương án 1 (Không tối ưu): Mỗi máy 1 tiến trình MPI (`-np 3`)**
+- Ở phương án này, ta ép mỗi máy gánh đúng 1 tiến trình (Rank 0, 1, 2). Sau đó để OpenMP tự đẻ ra 4 luồng trên Master và 2 luồng trên mỗi Slave.
+- **Vấn đề chí mạng:** Hàm chia dải đỉnh `1D Partitioning` của nhóm chia đồ thị dựa vào số tiến trình $P$ (`num_ranks = 3`). Do đó, đồ thị bị chặt làm 3 khúc **BẰNG NHAU**. 
+- Kết quả: Master dùng 4 nhân để giải 1/3 đồ thị (chạy rất nhanh), còn Slave chỉ có 2 nhân để giải 1/3 đồ thị (chạy chậm rùa). Master làm xong sớm phải đứng im tại rào cản `MPI_Allreduce` để đợi 2 Slave. Toàn bộ 2 nhân sức mạnh chênh lệch của Master bị lãng phí hoàn toàn!
+
+**Phương án 2 (Cách nhóm dùng - Tối ưu): Spawn số tiến trình MPI tỉ lệ thuận với số nhân CPU (`-np 8`)**
+- Trong file `hostfile`, nhóm cấu hình số `slots` tương đương số nhân vật lý của máy:
+  `master slots=4`
+  `slave1 slots=2`
+  `slave2 slots=2`
+- Nhóm chạy lệnh: `mpirun -np 8 --hostfile hostfile ...` và ép `OMP_NUM_THREADS=1`.
+- **Cách thuật toán tỏa sáng:** Lúc này hệ thống có tổng cộng 8 tiến trình MPI. Đồ thị tự động được chia làm **8 khúc bằng nhau**.
+  - OpenMPI sẽ ném 4 tiến trình (tương đương 4/8 lượng công việc) lên máy Master.
+  - OpenMPI ném 2 tiến trình (2/8 công việc) lên Slave 1, và 2 tiến trình (2/8 công việc) lên Slave 2.
+- **Kết quả:** Master nhận lượng việc gấp đôi Slave, nhưng bù lại nó có số nhân CPU nhiều gấp đôi. Do đó, cả 3 máy sẽ giải quyết xong khối lượng công việc của mình trong cùng một khoảng thời gian xấp xỉ nhau $T$. Hệ thống đạt được trạng thái **Cân bằng tải (Load Balancing) hoàn hảo**, ép cả 8 nhân CPU của 3 máy chạy hết 100% công suất mà không ai phải chờ ai!
+
 ### Q6. Tại sao nhóm lại nạp toàn bộ đồ thị (Replicate) vào bộ nhớ của tất cả các máy thay vì chia nhỏ mảng đồ thị ra?
 **Trả lời:**
 - Việc sao chép toàn bộ đồ thị (Graph Replication) lên mọi máy giúp **loại bỏ hoàn toàn chi phí giao tiếp Point-to-Point**. Khi một tiến trình đang duyệt đỉnh của nó và cần xem đỉnh kề, nó có thể tra cứu ngay lập tức trong RAM cục bộ mà không cần phải gửi tin nhắn `MPI_Recv` sang máy khác để xin dữ liệu.
