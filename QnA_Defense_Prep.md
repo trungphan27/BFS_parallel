@@ -116,10 +116,17 @@ Hệ thống sử dụng chiến lược giao tiếp tập thể, đồng bộ v
 - Đồ thị R-MAT mô phỏng mạng xã hội thực tế, có tính chất **lệch bậc cực kỳ nghiêm trọng (power-law degree skew)**. Sẽ có một số ít đỉnh "hub" kết nối với hàng triệu đỉnh khác (như người nổi tiếng), còn đại đa số các đỉnh khác chỉ có vài kết nối.
 - Do chia đỉnh tĩnh (1D Partitioning), tiến trình Rank 0 (chứa các đỉnh đầu tiên) trong thí nghiệm của nhóm phải gánh tới **55 triệu cạnh**, trong khi Rank 7 chỉ làm việc với **1.8 triệu cạnh** (Tỷ lệ workload 30:1). Điều này gây ra mất cân bằng tải vật lý.
 
-### Q12. Bọn em giải quyết sự mất cân bằng đó như thế nào?
+### Q12. Bọn em giải quyết sự mất cân bằng đó (Load Balancing) như thế nào?
 **Trả lời:**
-- Ở **tầng MPI** giữa các máy: Em chia rải đều số đỉnh (Static).
-- Ở **tầng OpenMP** bên trong từng máy: Bọn em sử dụng `#pragma omp for schedule(dynamic, chunk_size)`. Lập lịch động (Dynamic) giúp các luồng xử lý xong các đỉnh ít cạnh có thể tự động nhảy sang "gánh" phụ các đỉnh Hub nhiều cạnh, hạn chế được việc có luồng chạy rỗng (idle).
+Hệ thống giải quyết sự bất bình đẳng của đồ thị R-MAT bằng chiến thuật "Ngoài tĩnh - Trong động":
+- **Ở tầng mạng MPI (Giữa các máy) - Phân rã Tĩnh (Static Partitioning):**
+  + Cách chia: Tổng số đỉnh được chia làm các khối bằng nhau và gắn chặt (cố định) cho từng tiến trình MPI.
+  + Tại sao Tĩnh? Bởi vì giao tiếp mạng LAN rất chậm. Nếu áp dụng chia việc động ở tầng này (máy làm nhanh nhảy sang xin việc của máy làm chậm), chi phí truyền tải đồ thị qua dây mạng sẽ làm sập toàn bộ hiệu năng hệ thống. Do đó, phải chia tĩnh từ đầu để loại bỏ hoàn toàn chi phí giao tiếp Point-to-Point.
+- **Ở tầng CPU OpenMP (Bên trong 1 máy) - Lập lịch Động (Dynamic Scheduling):**
+  + Cú pháp: Bọn em sử dụng `#pragma omp for schedule(dynamic, chunk_size)`.
+  + Cơ chế hoạt động: Nhờ dùng chung 1 thanh RAM, OpenMP tạo ra một "rổ công việc chung". Các luồng CPU (threads) sẽ liên tục bốc từng khối đỉnh nhỏ (chunk) ra xử lý.
+  + Hiệu quả cân bằng tải: Nếu luồng 1 xui xẻo bốc trúng đỉnh Hub (có hàng trăm nghìn cạnh), nó sẽ bị kẹt xử lý rất lâu. Tuy nhiên, các luồng 2, 3, 4 bốc phải các đỉnh nhỏ lẻ nên giải quyết cực nhanh, sau đó *ngay lập tức thò tay vào rổ bốc tiếp việc khác*. 
+  + Kết quả: Nhờ sự linh hoạt của Dynamic, các luồng rảnh rỗi sẽ tự động dọn dẹp sạch sẽ toàn bộ công việc còn lại để "gánh" phụ cho luồng 1. Hệ thống ép toàn bộ 100% nhân CPU vật lý luôn trong trạng thái chạy hết tốc lực, loại bỏ triệt để tình trạng luồng chạy rỗng (idle waiting)!
 
 ---
 
@@ -127,25 +134,44 @@ Hệ thống sử dụng chiến lược giao tiếp tập thể, đồng bộ v
 
 ### Q13. Nhóm đánh giá Tính đúng đắn (Correctness) như thế nào?
 **Trả lời:**
-Bọn em chạy song song 2 phiên bản: một bản chạy Tuần tự (Sequential Baseline) và một bản chạy Phân tán trên Cluster. Sau đó so khớp mảng khoảng cách `dist[]` từng phần tử một. Dù đổi số lượng máy hay số luồng, kết quả vẫn báo `PASSED` tuyệt đối.
+Bọn em chạy song song 2 phiên bản: một bản chạy Tuần tự (Sequential Baseline) và một bản chạy Phân tán trên Cluster. Sau đó tự động kiểm tra bằng cờ `--verify` để so khớp mảng khoảng cách `dist[]` từng đỉnh một. Dù đổi cấu hình máy hay số luồng (Bảng 3 trong báo cáo), kết quả vẫn báo `PASSED` tuyệt đối.
 
-### Q14. Giải thích hiện tượng Speedup $S(P)$ tổng thể sụp đổ (crashing to near zero) khi tăng số máy/tiến trình?
+### Q14. Tại sao đối với các đồ thị quá nhỏ (N = 16,384 đỉnh), Speedup của hệ thống lại nhỏ hơn 1 (chạy chậm hơn cả bản tuần tự)?
 **Trả lời:**
-- Khi bọn em đo **Thời gian tính toán thuần $T_{comp}$** (đã trừ đi thời gian đợi mạng), hệ thống đạt độ tăng tốc $S'(P)$ gần như tuyến tính tuyệt vời (tăng 2.14 lần). Chứng tỏ thuật toán chia để trị rất hoàn hảo.
-- Tuy nhiên, **Thời gian tổng $T_{total}$** lại bị thắt cổ chai trầm trọng do giao tiếp mạng ($T_{comm}$ chiếm 99.9% thời gian). 
-- **Nguyên nhân:** Hàm `MPI_Allreduce` ở cuối mỗi vòng lặp yêu cầu các máy phải truyền mảng `dist[]` dung lượng $O(N)$ (hàng chục MB) qua mạng LAN. Qua 6 level duyệt, hệ thống phải bơm qua lại mạng LAN xấp xỉ 200 Megabyte dữ liệu. Tốc độ tính toán của CPU thì tính bằng mili-giây, nhưng độ trễ vật lý (latency) của mạng cáp quang LAN thì mất tới hàng chục giây. Do đó, mạng không theo kịp CPU.
+Điều này là hoàn toàn hợp lý. Đối với đồ thị nhỏ, khối lượng tính toán là quá ít, thuật toán tính xong chỉ trong chưa tới 1 mili-giây. Tuy nhiên, hệ thống phân tán lại phải "trả phí" (overhead) cho việc thiết lập mạng và gọi lệnh `MPI_Allreduce` để truyền dữ liệu qua cáp mạng LAN. Khi chi phí truyền tải mạng lớn hơn rất nhiều so với thời gian tính toán, hệ thống cụm máy tính sẽ trở nên chậm hơn cả 1 laptop chạy tuần tự.
 
-### Q15. Nếu muốn hệ thống này chạy nhanh hơn nữa và Scale tốt hơn thì nhóm sẽ đề xuất cải tiến gì trong tương lai?
+### Q15. Nhóm làm sao để đo lường chính xác thời gian chạy thuật toán BFS mà không bị nhiễu?
 **Trả lời:**
-1. **Phân rã theo Cạnh (Edge-balanced Partitioning) hoặc 2D Partitioning:** Thay vì chia số đỉnh bằng nhau, sẽ chia sao cho tổng số cạnh mỗi tiến trình bằng nhau. Tránh việc Rank 0 bị quá tải.
-2. **Giao tiếp Bất đồng bộ (Asynchronous Communication):** Sử dụng `MPI_Iallreduce` (Non-blocking) để CPU có thể tranh thủ tính toán các đỉnh không phụ thuộc trong lúc chờ card mạng gửi nhận dữ liệu.
-3. Chạy trên mạng chuyên dụng cho siêu máy tính như **InfiniBand** thay vì mạng Ethernet LAN thông thường để giảm thiểu tối đa độ trễ.
+Bọn em đã thiết lập các bộ đếm thời gian (timer) để **cô lập hoàn toàn** phần lõi duyệt đồ thị. Quá trình sinh đồ thị R-MAT (chiếm rất nhiều thời gian) được đo riêng và tách hoàn toàn khỏi biến thời gian `BFS Time`. Bên cạnh đó, bọn em đặt các rào cản `MPI_Barrier` trước khi bấm giờ để đảm bảo 3 máy xuất phát cùng một thời điểm, tránh việc máy nhanh chạy trước làm sai lệch kết quả.
+
+### Q16. Làm thế nào nhóm chọn ra được quy mô đồ thị $N_0 \approx 6.2$ triệu đỉnh cho bài test?
+**Trả lời:**
+Yêu cầu của dự án là phải tìm ra kích thước $N_0$ sao cho cụm máy tính chạy mất khoảng 2 đến 3 phút. Bọn em đã cố định cấu hình 8 tiến trình ($P=8$) và quét thử số đỉnh từ 500k lên đến hơn 6 triệu. Ở mốc $N = 6,291,456$ đỉnh (tương đương 217 triệu cạnh), tổng thời gian chạy đạt xấp xỉ 103 giây (1.7 phút), tiệm cận với mục tiêu đề ra nên nhóm quyết định chọn nó làm baseline $N_0$.
+
+### Q17. Báo cáo (Bảng 5) ghi nhận mức độ Mất cân bằng tải (Load Imbalance) chỉ là 0.05%, một con số quá hoàn hảo. Có thực sự là hệ thống chia tải hoàn hảo đến vậy không?
+**Trả lời:**
+Dạ thưa, đây là một **sự đánh lừa (Deceptive result)** của các công cụ đo lường thời gian:
+- Nhìn vào khối lượng cạnh, Rank 0 gánh tới **55 triệu cạnh**, trong khi Rank 7 chỉ làm việc với **1.8 triệu cạnh** (Tỷ lệ 30:1). Đây là sự mất cân bằng vật lý cực kỳ nghiêm trọng do bản chất lệch bậc (Power-law) của đồ thị R-MAT.
+- Tuy nhiên, thời gian chạy tổng lại chênh lệch rất ít (chỉ 19ms trên tổng số 41.4s). Nguyên nhân là do lệnh đồng bộ mạng `MPI_Allreduce` có tính chất chặn (Blocking). Các Rank rảnh việc (như Rank 7) chạy xong rất nhanh nhưng **phải đứng im (idle) ở rào cản** để đợi Rank 0 làm xong. 
+- Đồng hồ đo thời gian đã cộng gộp cả khoảng thời gian đứng đợi (idle) vô ích này vào biến "Thời gian giao tiếp mạng" ($T_{comm}$). Vì vậy, sự mất cân bằng tính toán thực sự đã bị che khuất đằng sau độ trễ giao tiếp khổng lồ.
+
+### Q18. Giải thích hiện tượng Speedup tổng thể $S(P)$ sụp đổ (crashing to near zero) khi tăng số tiến trình?
+**Trả lời:**
+- Khi bọn em phân tích riêng **Thời gian tính toán thuần $T_{comp}$** (đã trừ đi thời gian đợi mạng), hệ thống đạt độ tăng tốc $S'(P)$ tuyến tính rất tuyệt vời (tăng 2.14 lần ở $P=8$). Chứng tỏ thuật toán chia đỉnh cho CPU làm việc là rất đúng đắn.
+- Tuy nhiên, **Thời gian tổng $T_{total}$** lại bị thắt cổ chai trầm trọng do mạng LAN ($T_{comm}$ chiếm 99.95% thời gian). 
+- **Nguyên nhân:** Hàm `MPI_Allreduce` yêu cầu 3 máy phải trao đổi toàn bộ mảng `dist[]` dung lượng $O(N)$ (hàng chục MB). Qua 6 level duyệt BFS, 3 máy phải bơm qua cáp mạng LAN xấp xỉ 200 Megabyte dữ liệu. Tốc độ CPU tính bằng mili-giây, nhưng dây cáp đồng LAN thì mất tới hàng chục giây. Do đó mạng vật lý đã bóp nghẹt toàn bộ hiệu năng của CPU.
+
+### Q19. Nếu muốn hệ thống này chạy nhanh hơn nữa và Scale tốt hơn thì nhóm sẽ đề xuất cải tiến gì trong tương lai?
+**Trả lời:**
+1. **Phân rã theo Cạnh (Edge-balanced Partitioning) hoặc 2D Partitioning:** Thay vì chia số đỉnh bằng nhau (1D), sẽ đổi thuật toán chia sao cho tổng số cạnh mỗi tiến trình bằng nhau. Tránh việc Rank 0 bị quá tải (Giải quyết triệt để vấn đề mất cân bằng tải ở Q17).
+2. **Giao tiếp Bất đồng bộ (Asynchronous Communication):** Sử dụng `MPI_Iallreduce` (Non-blocking) để CPU có thể tranh thủ tính toán các đỉnh không phụ thuộc trong lúc chờ card mạng gửi/nhận dữ liệu.
+3. Chạy trên mạng chuyên dụng cho siêu máy tính như **InfiniBand** thay vì mạng Ethernet thông thường để giảm thiểu tối đa độ trễ truyền phát các mảng khổng lồ $O(N)$.
 
 ---
 
 ## PHẦN 6: KIẾN THỨC VẬN HÀNH THỰC TẾ CLUSTER (+0.5 SET UP CLUSTER IN 15 MINS)
 
-### Q16. Làm thế nào để setup Cluster nhanh trong 15 phút bảo vệ?
+### Q20. Làm thế nào để setup Cluster nhanh trong 15 phút bảo vệ?
 **Trả lời:**
 1. Bọn em sẽ cắm cáp LAN nối 3 laptop thông qua 1 Switch Gigabit (hoặc nối chung mạng Wifi nội bộ).
 2. Dùng lệnh `ip a` xem IP. Vào file `sudo nano /etc/hosts` trên cả 3 máy để khai báo IP cho `node01, node02, node03`.
@@ -157,26 +183,26 @@ Bọn em chạy song song 2 phiên bản: một bản chạy Tuần tự (Sequen
    `node03 slots=2`
 6. Biên dịch lại code một lần trên master (`make`) và chạy lệnh `mpirun -np 8 --hostfile hostfile ./bfs_hybrid ...`. Mọi thứ đã sẵn sàng hoạt động.
 
-### Q17. Lệnh `mpirun` hoạt động như thế nào khi chạy trên 3 máy? Làm sao nó biết máy nào để chạy?
+### Q21. Lệnh `mpirun` hoạt động như thế nào khi chạy trên 3 máy? Làm sao nó biết máy nào để chạy?
 **Trả lời:**
 - Khi bọn em gõ lệnh trên máy Master, `mpirun` sẽ đọc file `--hostfile hostfile` để biết danh sách các node (máy) và số lượng `slots` (số tiến trình tối đa) trên từng máy. 
 - Sau đó, `mpirun` tự động dùng giao thức **SSH** ngầm kết nối sang 2 máy Slave, và khởi tạo các tiến trình MPI trên đó sao cho tổng số tiến trình bằng đúng số `np` (ví dụ `-np 8`). 
 - Khi các tiến trình đã được sinh ra trên 3 máy, chúng tự động liên lạc với nhau qua mạng LAN thông qua môi trường MPI để bắt đầu phối hợp tính toán.
 
-### Q18. Thư mục chia sẻ NFS (Network File System) đóng vai trò gì trong Cluster của nhóm?
+### Q22. Thư mục chia sẻ NFS (Network File System) đóng vai trò gì trong Cluster của nhóm?
 **Trả lời:**
 - NFS giúp **đồng bộ mã nguồn và file thực thi** (`bfs_hybrid`) giữa tất cả 3 máy theo thời gian thực. 
 - Bọn em chỉ cần lập trình và compile (`make`) **một lần duy nhất** trên máy Master, file thực thi sẽ ngay lập tức xuất hiện trên các máy Slave ở đúng đường dẫn đó. 
 - Điều này giúp `mpirun` có thể ra lệnh cho Slave chạy file thực thi mà không báo lỗi "File not found". Nếu không có NFS, bọn em sẽ phải dùng lệnh `scp` copy thủ công file chạy sang 2 máy Slave mỗi khi sửa một dòng code, rất tốn thời gian.
 
-### Q19. Quy trình chuẩn để kiểm tra kết nối 3 máy (Ping, NFS) trước khi chạy thuật toán là gì?
+### Q23. Quy trình chuẩn để kiểm tra kết nối 3 máy (Ping, NFS) trước khi chạy thuật toán là gì?
 **Trả lời:**
 Dạ thưa thầy/cô, quy trình chuẩn của bọn em gồm 3 bước:
 - **Bước 1 (Mạng):** Gõ `ip a` xem IP, khai báo vào `/etc/hosts`. Dùng lệnh `ping node02` để đảm bảo mạng thông suốt.
 - **Bước 2 (File System):** Trên Master kiểm tra file `/etc/exports` chứa subnet của mạng. Trên Slaves kiểm tra file `/etc/fstab` và chạy `sudo mount -a`. Dùng lệnh `ls` để xem file của Master đã hiện lên Slave chưa.
 - **Bước 3 (MPI Connection):** Chạy lệnh test: `mpirun -np 12 --hostfile hostfile hostname`. Nếu màn hình in ra được hỗn hợp tên của cả 3 máy chủ thì có nghĩa là kết nối đã thành công mỹ mãn. Lúc này mới bắt đầu chạy code BFS thực sự.
 
-### Q20. Khi nhóm chạy lệnh `OMP_NUM_THREADS=1 mpirun -np 8 --hostfile hostfile ./bfs_hybrid 500000 16 42`, ý nghĩa của các tham số là gì?
+### Q24. Khi nhóm chạy lệnh `OMP_NUM_THREADS=1 mpirun -np 8 --hostfile hostfile ./bfs_hybrid 500000 16 42`, ý nghĩa của các tham số là gì?
 **Trả lời:**
 - `OMP_NUM_THREADS=1`: Bọn em ép biến môi trường này để giới hạn mỗi tiến trình MPI chỉ sinh ra 1 luồng OpenMP (dùng để cô lập hiệu năng khi muốn test chế độ chạy thuần MPI).
 - `-np 8`: Chạy tổng cộng 8 tiến trình (phân bổ theo hostfile: 4 cho Master, 2 cho Slave 1, 2 cho Slave 2).
